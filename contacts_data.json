@@ -1,0 +1,22 @@
+{
+  "contacts": [
+    {
+      "first_name": "rafiq",
+      "last_name": "",
+      "phone": "55",
+      "email": "",
+      "company": "",
+      "address": "",
+      "notes": "",
+      "favorite": false,
+      "id": "6b4f5de282624d258a2084aba878cef0",
+      "created_at": "2026-06-26T15:07:06",
+      "updated_at": "2026-06-26T15:07:06"
+    }
+  ],
+  "_meta": {
+    "app": "Contact Manager",
+    "saved_at": "2026-06-26T15:07:06",
+    "version": 1
+  }
+}
