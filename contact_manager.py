@@ -7,6 +7,14 @@ A single-file desktop Contact Management application for Windows.
 - No SQL database — contacts are stored locally in a JSON file (contacts_data.json)
   created automatically next to this script the first time you run it.
 - Add / Edit / Delete / Search / Sort contacts
+- Explicit "view" vs "edit" mode: selecting a contact shows it read-only with
+  an Edit button, so you never accidentally change something while browsing.
+- Export your contacts as a full JSON backup, or as a CSV file in the same
+  column layout Google Contacts uses (so it also imports into Google Contacts,
+  Excel, Outlook, etc).
+- Import contacts back from a JSON backup or CSV file (Google Contacts,
+  Outlook, Apple, or a generic Name/Phone/Email sheet). Duplicates already in
+  your list (matched by phone or email) are skipped automatically.
 - Fields: First Name, Last Name, Phone, Email, Address, Company, Notes, Favorite
 - Data is saved automatically after every change (no "Save" button to forget)
 
@@ -17,13 +25,14 @@ Requirements:
     Python 3.8+ (Tkinter is included with standard Python on Windows)
 """
 
+import csv
 import json
 import os
 import re
 import sys
 import uuid
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
 
 # --------------------------------------------------------------------------
@@ -199,6 +208,181 @@ class ContactStore:
             )
         return contacts
 
+    # ---- export ---------------------------------------------------------
+
+    def export_json(self, path):
+        """Full-fidelity backup (every field, including favorite/id/timestamps)."""
+        payload = {
+            "contacts": self.contacts,
+            "_meta": {
+                "app": APP_TITLE,
+                "exported_at": datetime.now().isoformat(timespec="seconds"),
+                "version": 1,
+                "count": len(self.contacts),
+            },
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        return len(self.contacts)
+
+    def export_csv(self, path):
+        """
+        Google-Contacts-style CSV export. Uses the same column names Google
+        Contacts uses for its own export/import, so this file can also be
+        opened in Google Contacts, Excel, Outlook, etc.
+        """
+        fieldnames = [
+            "First Name", "Last Name", "Phone 1 - Value", "E-mail 1 - Value",
+            "Organization Name", "Address 1 - Formatted", "Notes", "Favorite",
+        ]
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for c in self.contacts:
+                writer.writerow({
+                    "First Name": c.get("first_name", ""),
+                    "Last Name": c.get("last_name", ""),
+                    "Phone 1 - Value": c.get("phone", ""),
+                    "E-mail 1 - Value": c.get("email", ""),
+                    "Organization Name": c.get("company", ""),
+                    "Address 1 - Formatted": c.get("address", ""),
+                    "Notes": c.get("notes", ""),
+                    "Favorite": "Yes" if c.get("favorite") else "",
+                })
+        return len(self.contacts)
+
+    # ---- import -----------------------------------------------------------
+
+    def _existing_signatures(self):
+        """A set of (phone, email) signatures used to detect duplicates."""
+        sigs = set()
+        for c in self.contacts:
+            phone = (c.get("phone") or "").strip().lower()
+            email = (c.get("email") or "").strip().lower()
+            if phone or email:
+                sigs.add((phone, email))
+        return sigs
+
+    def import_json(self, path, skip_duplicates=True):
+        """
+        Import contacts from a JSON backup produced by this app (export_json
+        or the regular contacts_data.json). Returns (added, skipped, errors).
+        """
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+
+        records = raw.get("contacts", raw if isinstance(raw, list) else [])
+        return self._import_records(records, skip_duplicates)
+
+    def import_csv(self, path, skip_duplicates=True):
+        """
+        Import contacts from a CSV file. Understands Google Contacts' export
+        column names (e.g. "Given Name"/"First Name", "Phone 1 - Value")
+        and falls back to looser matching for other common CSV exports
+        (Outlook, Apple, plain "Name,Phone,Email" sheets, etc.).
+        Returns (added, skipped, errors).
+        """
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+            headers = reader.fieldnames or []
+
+        records = [self._map_csv_row(row, headers) for row in rows]
+        return self._import_records(records, skip_duplicates)
+
+    @staticmethod
+    def _first_present(row, *keys):
+        for k in keys:
+            if k in row and row[k]:
+                return row[k].strip()
+        return ""
+
+    def _map_csv_row(self, row, headers):
+        """Map one CSV row (from Google/Outlook/Apple/generic export) to our
+        internal field names."""
+        first = self._first_present(row, "First Name", "Given Name", "first_name", "First")
+        last = self._first_present(row, "Last Name", "Family Name", "last_name", "Last")
+
+        if not first and not last:
+            # Fall back to a single "Name"/"Full Name" column, split it.
+            full = self._first_present(row, "Name", "Full Name", "name")
+            if full:
+                parts = full.split(" ", 1)
+                first = parts[0]
+                last = parts[1] if len(parts) > 1 else ""
+
+        phone = self._first_present(
+            row, "Phone 1 - Value", "Phone Number", "Phone", "phone",
+            "Mobile Phone", "Primary Phone",
+        )
+        email = self._first_present(
+            row, "E-mail 1 - Value", "E-mail Address", "Email", "email", "Primary Email",
+        )
+        company = self._first_present(
+            row, "Organization Name", "Company", "company", "Organization",
+        )
+        address = self._first_present(
+            row, "Address 1 - Formatted", "Address", "address", "Home Address",
+        )
+        notes = self._first_present(row, "Notes", "notes", "Note")
+        favorite_raw = self._first_present(row, "Favorite", "favorite").lower()
+        favorite = favorite_raw in ("yes", "true", "1", "y")
+
+        return {
+            "first_name": first,
+            "last_name": last,
+            "phone": phone,
+            "email": email,
+            "company": company,
+            "address": address,
+            "notes": notes,
+            "favorite": favorite,
+        }
+
+    def _import_records(self, records, skip_duplicates):
+        existing_sigs = self._existing_signatures()
+        added, skipped, errors = 0, 0, 0
+
+        for raw in records:
+            try:
+                first = str(raw.get("first_name", "")).strip()
+                last = str(raw.get("last_name", "")).strip()
+                phone = str(raw.get("phone", "")).strip()
+                email = str(raw.get("email", "")).strip()
+
+                if not first and not last and not phone and not email:
+                    continue  # blank row, silently ignore
+
+                if not first:
+                    # First name is required by this app's validation rules;
+                    # fall back to last name or a generic label rather than
+                    # silently dropping a real contact.
+                    first = last or "Unnamed"
+                    last = "" if first == last else last
+
+                sig = (phone.lower(), email.lower())
+                if skip_duplicates and (phone or email) and sig in existing_sigs:
+                    skipped += 1
+                    continue
+
+                data = {
+                    "first_name": first,
+                    "last_name": last,
+                    "phone": phone,
+                    "email": email,
+                    "company": str(raw.get("company", "")).strip(),
+                    "address": str(raw.get("address", "")).strip(),
+                    "notes": str(raw.get("notes", "")).strip(),
+                    "favorite": bool(raw.get("favorite", False)),
+                }
+                self.add(data)
+                existing_sigs.add(sig)
+                added += 1
+            except Exception:
+                errors += 1
+
+        return added, skipped, errors
+
 
 # --------------------------------------------------------------------------
 # Small reusable UI helpers
@@ -296,6 +480,17 @@ class LabeledEntry(tk.Frame):
     def focus(self):
         self.entry.focus_set()
 
+    def set_readonly(self, readonly):
+        if readonly:
+            self.entry.configure(state="disabled", disabledforeground=COLORS["text"],
+                                  disabledbackground=COLORS["row_alt"])
+            self.entry_frame.configure(bg=COLORS["row_alt"],
+                                        highlightbackground=COLORS["row_alt"])
+        else:
+            self.entry.configure(state="normal")
+            self.entry_frame.configure(bg=COLORS["white"],
+                                        highlightbackground=COLORS["border"])
+
     def flash_error(self):
         self.entry_frame.configure(highlightbackground=COLORS["danger"],
                                     highlightthickness=2)
@@ -325,6 +520,7 @@ class ContactManagerApp:
 
         self.refresh_list()
         self._clear_form(focus=False)
+        self._set_mode("edit")
 
     # ---- window / style ---------------------------------------------------
 
@@ -396,6 +592,31 @@ class ContactManagerApp:
 
         right = tk.Frame(bar, bg=COLORS["bg"])
         right.pack(side="right")
+
+        # Backup menu (Export / Import) — styled to match the rest of the UI
+        backup_frame = tk.Frame(right, bg=COLORS["bg"])
+        backup_frame.pack(side="right", padx=(10, 0))
+        make_label(backup_frame, "Backup", size=9, color=COLORS["muted"]).pack(anchor="w")
+
+        self.backup_menu_btn = tk.Menubutton(
+            backup_frame, text="⬇⬆  Export / Import", relief="flat",
+            font=(FONT_FAMILY, 9, "bold"), bg=COLORS["white"], fg=COLORS["text"],
+            activebackground=COLORS["accent_light"], activeforeground=COLORS["text"],
+            bd=1, padx=10, pady=6, cursor="hand2",
+            highlightbackground=COLORS["border"], highlightthickness=1,
+        )
+        backup_menu = tk.Menu(self.backup_menu_btn, tearoff=0,
+                               font=(FONT_FAMILY, 9), bg=COLORS["white"],
+                               fg=COLORS["text"], activebackground=COLORS["accent_light"])
+        backup_menu.add_command(label="📤  Export as JSON backup (full)",
+                                 command=self.export_json_dialog)
+        backup_menu.add_command(label="📄  Export as CSV (Google Contacts format)",
+                                 command=self.export_csv_dialog)
+        backup_menu.add_separator()
+        backup_menu.add_command(label="📥  Import from file...",
+                                 command=self.import_dialog)
+        self.backup_menu_btn.configure(menu=backup_menu)
+        self.backup_menu_btn.pack()
 
         # Sort dropdown
         sort_frame = tk.Frame(right, bg=COLORS["bg"])
@@ -566,29 +787,35 @@ class ContactManagerApp:
                                 font=(FONT_FAMILY, 10), bg=COLORS["white"],
                                 fg=COLORS["text"], bd=0, padx=10, pady=8)
         self.f_notes.pack(fill="x")
+        self.notes_box = notes_box
 
         self.error_label = make_label(form, "", size=9, color=COLORS["danger"],
                                        bg=COLORS["sidebar"])
         self.error_label.pack(fill="x", padx=20, pady=(0, 4), anchor="w")
 
         # Action buttons (fixed at bottom, not scrolled)
+        # Different buttons are shown depending on mode:
+        #   - View mode (a saved contact is selected): Edit + Delete
+        #   - Edit mode (new contact, or editing an existing one): Save + Cancel
         actions = tk.Frame(panel, bg=COLORS["sidebar"])
         actions.grid(row=2, column=0, columnspan=2, sticky="ew", padx=20, pady=16)
+        self.actions_frame = actions
 
         self.save_btn = RoundedButton(actions, "💾  Save Contact", self.save_contact,
                                        bg=COLORS["accent"], hover_bg=COLORS["accent_dark"],
                                        width=160, height=38)
-        self.save_btn.pack(side="left")
+
+        self.edit_btn = RoundedButton(actions, "✏️  Edit", self.enter_edit_mode,
+                                       bg=COLORS["accent"], hover_bg=COLORS["accent_dark"],
+                                       width=110, height=38)
 
         self.delete_btn = RoundedButton(actions, "🗑  Delete", self.delete_contact,
                                          bg=COLORS["danger"], hover_bg=COLORS["danger_dark"],
                                          width=110, height=38)
-        self.delete_btn.pack(side="left", padx=(10, 0))
 
-        self.cancel_btn = RoundedButton(actions, "Cancel", self.new_contact,
+        self.cancel_btn = RoundedButton(actions, "Cancel", self.cancel_edit,
                                          bg=COLORS["border"], hover_bg=COLORS["border"],
                                          fg=COLORS["text"], width=90, height=38)
-        self.cancel_btn.pack(side="right")
 
     # ---- list / search / sort behavior -------------------------------------
 
@@ -639,8 +866,101 @@ class ContactManagerApp:
             self._load_contact_into_form(contact)
 
     def edit_contact_focus(self):
+        """Double-click on a row jumps straight into edit mode."""
         if self.selected_id:
-            self.f_first.focus()
+            self.enter_edit_mode()
+
+    # ---- export / import ---------------------------------------------------
+
+    def export_json_dialog(self):
+        if not self.store.contacts:
+            messagebox.showinfo("Nothing to export", "You don't have any contacts yet.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export contacts as JSON backup",
+            defaultextension=".json",
+            filetypes=[("JSON backup", "*.json")],
+            initialfile=f"contacts_backup_{datetime.now().strftime('%Y-%m-%d')}.json",
+        )
+        if not path:
+            return
+        try:
+            count = self.store.export_json(path)
+            messagebox.showinfo("Export complete",
+                                 f"Exported {count} contact{'s' if count != 1 else ''} to:\n{path}")
+        except OSError as e:
+            messagebox.showerror("Export failed", f"Could not write the file:\n{e}")
+
+    def export_csv_dialog(self):
+        if not self.store.contacts:
+            messagebox.showinfo("Nothing to export", "You don't have any contacts yet.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export contacts as CSV (Google Contacts format)",
+            defaultextension=".csv",
+            filetypes=[("CSV file", "*.csv")],
+            initialfile=f"contacts_backup_{datetime.now().strftime('%Y-%m-%d')}.csv",
+        )
+        if not path:
+            return
+        try:
+            count = self.store.export_csv(path)
+            messagebox.showinfo("Export complete",
+                                 f"Exported {count} contact{'s' if count != 1 else ''} to:\n{path}\n\n"
+                                 "This CSV uses the same column layout as Google Contacts, "
+                                 "so it can also be imported there.")
+        except OSError as e:
+            messagebox.showerror("Export failed", f"Could not write the file:\n{e}")
+
+    def import_dialog(self):
+        path = filedialog.askopenfilename(
+            title="Import contacts",
+            filetypes=[
+                ("Contacts backup", "*.json *.csv"),
+                ("JSON backup", "*.json"),
+                ("CSV (Google Contacts, Outlook, Apple...)", "*.csv"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        confirm = messagebox.askyesno(
+            "Import contacts",
+            "Importing will add new contacts from this file.\n"
+            "Contacts that already exist (matched by phone or email) will be skipped "
+            "automatically so you won't get duplicates.\n\nContinue?",
+        )
+        if not confirm:
+            return
+
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            if ext == ".json":
+                added, skipped, errors = self.store.import_json(path)
+            elif ext == ".csv":
+                added, skipped, errors = self.store.import_csv(path)
+            else:
+                # Unknown extension — sniff the content instead of guessing.
+                with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
+                    head = f.read(200).lstrip()
+                if head.startswith("{") or head.startswith("["):
+                    added, skipped, errors = self.store.import_json(path)
+                else:
+                    added, skipped, errors = self.store.import_csv(path)
+        except (json.JSONDecodeError, OSError, csv.Error) as e:
+            messagebox.showerror("Import failed",
+                                  f"Couldn't read that file as a contacts backup:\n{e}")
+            return
+
+        self.refresh_list()
+
+        summary = f"Added {added} new contact{'s' if added != 1 else ''}."
+        if skipped:
+            summary += f"\nSkipped {skipped} duplicate{'s' if skipped != 1 else ''} already in your list."
+        if errors:
+            summary += f"\n{errors} row{'s' if errors != 1 else ''} could not be read and were skipped."
+        messagebox.showinfo("Import complete", summary)
 
     # ---- form behavior ------------------------------------------------------
 
@@ -648,6 +968,58 @@ class ContactManagerApp:
         self.selected_id = None
         self.tree.selection_remove(self.tree.selection())
         self._clear_form()
+        self._set_mode("edit")
+
+    def _set_mode(self, mode):
+        """
+        mode is "view" (a saved contact selected, fields read-only, Edit
+        button shown) or "edit" (new contact, or actively editing one;
+        fields editable, Save/Cancel shown).
+        """
+        self.mode = mode
+        is_view = (mode == "view")
+
+        for field in (self.f_first, self.f_last, self.f_phone, self.f_email,
+                      self.f_company, self.f_address):
+            field.set_readonly(is_view)
+        self.f_notes.configure(state="normal")  # must be normal to change bg in some Tk builds
+        self.f_notes.configure(bg=COLORS["row_alt"] if is_view else COLORS["white"])
+        self.f_notes.configure(state="disabled" if is_view else "normal")
+        self.notes_box.configure(
+            bg=COLORS["row_alt"] if is_view else COLORS["white"],
+            highlightbackground=COLORS["row_alt"] if is_view else COLORS["border"],
+        )
+
+        # Favorite star is always clickable, even in view mode, since toggling
+        # it doesn't require the "edit" flow (mirrors most contacts apps).
+
+        # Swap button sets
+        for w in (self.save_btn, self.edit_btn, self.delete_btn, self.cancel_btn):
+            w.pack_forget()
+
+        if is_view:
+            self.edit_btn.pack(side="left")
+            self.delete_btn.pack(side="left", padx=(10, 0))
+        else:
+            self.save_btn.pack(side="left")
+            self.cancel_btn.pack(side="right")
+            if self.selected_id:
+                # Editing an existing contact: also allow deleting from here.
+                self.delete_btn.pack(side="left", padx=(10, 0))
+
+    def enter_edit_mode(self):
+        self._set_mode("edit")
+        self.f_first.focus()
+
+    def cancel_edit(self):
+        """Cancel out of edit mode: back to view if editing an existing
+        contact, or back to a blank new-contact form otherwise."""
+        if self.selected_id:
+            contact = self.store.get(self.selected_id)
+            if contact:
+                self._load_contact_into_form(contact)
+                return
+        self.new_contact()
 
     def _clear_form(self, focus=True):
         self.form_title.configure(text="New Contact")
@@ -656,15 +1028,16 @@ class ContactManagerApp:
         for field in (self.f_first, self.f_last, self.f_phone, self.f_email,
                       self.f_company, self.f_address):
             field.set("")
+        self.f_notes.configure(state="normal")
         self.f_notes.delete("1.0", "end")
         self.error_label.configure(text="")
-        self.delete_btn.set_enabled(False)
         if focus:
             self.f_first.focus()
 
     def _load_contact_into_form(self, contact):
         self.selected_id = contact["id"]
-        self.form_title.configure(text="Edit Contact")
+        name = f"{contact.get('first_name','')} {contact.get('last_name','')}".strip()
+        self.form_title.configure(text=name or "Edit Contact")
         self._current_favorite = contact.get("favorite", False)
         self._refresh_fav_icon()
         self.f_first.set(contact.get("first_name", ""))
@@ -673,10 +1046,11 @@ class ContactManagerApp:
         self.f_email.set(contact.get("email", ""))
         self.f_company.set(contact.get("company", ""))
         self.f_address.set(contact.get("address", ""))
+        self.f_notes.configure(state="normal")
         self.f_notes.delete("1.0", "end")
         self.f_notes.insert("1.0", contact.get("notes", ""))
         self.error_label.configure(text="")
-        self.delete_btn.set_enabled(True)
+        self._set_mode("view")
 
     def _refresh_fav_icon(self):
         if self._current_favorite:
@@ -737,8 +1111,10 @@ class ContactManagerApp:
         if self.tree.exists(self.selected_id):
             self.tree.selection_set(self.selected_id)
             self.tree.see(self.selected_id)
-        self.delete_btn.set_enabled(True)
-        self.form_title.configure(text="Edit Contact")
+
+        name = f"{data['first_name']} {data['last_name']}".strip()
+        self.form_title.configure(text=name or "Edit Contact")
+        self._set_mode("view")
         self._flash_saved()
 
     def _flash_saved(self):
